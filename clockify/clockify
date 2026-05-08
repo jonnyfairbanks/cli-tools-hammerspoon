@@ -1,0 +1,777 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "net/http"
+require "json"
+require "date"
+require "time"
+require "optparse"
+require "uri"
+
+API_BASE     = "https://api.clockify.me/api/v1"
+# ── EDIT ME ────────────────────────────────────────────────────────────────────
+# The Clockify project these commands default to. Override per-call with `-p`,
+# or set $CLOCKIFY_PROJECT in your shell rc to avoid baking it in.
+PROJECT_NAME = ENV["CLOCKIFY_PROJECT"] || "my-project"
+WEEKLY_LIMIT = (ENV["CLOCKIFY_WEEKLY_LIMIT"] || "40").to_f  # hours/week — used by `week`
+HOURLY_RATE  = (ENV["CLOCKIFY_HOURLY_RATE"] || "0").to_f    # USD/hour — used by paycheck readout (0 = no $ figures)
+# ───────────────────────────────────────────────────────────────────────────────
+
+CACHE_PATH   = File.join(ENV["HOME"], ".cache", "clockify", "status.json")
+CACHE_TTL    = 60  # seconds — `status` auto-refreshes from API if cache older than this
+
+class ClockifyError < StandardError; end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP
+
+def api_key
+  key = ENV["CLOCKIFY_API_KEY"]
+  if key.nil? || key.strip.empty?
+    warn "error: CLOCKIFY_API_KEY not set."
+    warn "        Add `export CLOCKIFY_API_KEY=...` to ~/.zshrc and reload your shell."
+    warn "        Generate a key at https://app.clockify.me/user/settings → API."
+    exit 2
+  end
+  key
+end
+
+def http_request(method, path, body: nil, query: {})
+  uri = URI.parse("#{API_BASE}/#{path.sub(%r{\A/}, "")}")
+  uri.query = URI.encode_www_form(query) unless query.empty?
+
+  req_class = { get: Net::HTTP::Get, post: Net::HTTP::Post, patch: Net::HTTP::Patch }.fetch(method)
+  req = req_class.new(uri)
+  req["X-Api-Key"] = api_key
+  req["Accept"]    = "application/json"
+  if body
+    req["Content-Type"] = "application/json"
+    req.body = JSON.generate(body)
+  end
+
+  res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 10, read_timeout: 30) do |http|
+    http.request(req)
+  end
+
+  unless res.is_a?(Net::HTTPSuccess)
+    raise ClockifyError, "Clockify API returned #{res.code} for #{uri.path}: #{res.body}"
+  end
+
+  res.body.to_s.empty? ? nil : JSON.parse(res.body)
+end
+
+def http_get(path, query = {})    = http_request(:get,   path, query: query)
+def http_post(path, body)         = http_request(:post,  path, body:  body)
+def http_patch(path, body)        = http_request(:patch, path, body:  body)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clockify resources
+
+def fetch_user
+  http_get("user")
+end
+
+def fetch_project(workspace_id, name)
+  projects = http_get("workspaces/#{workspace_id}/projects", { name: name, "page-size" => 50 })
+  projects.find { |p| p["name"].to_s.casecmp(name).zero? } ||
+    raise(ClockifyError, "No Clockify project matching #{name.inspect} (case-insensitive) in workspace. " \
+                         "Set $CLOCKIFY_PROJECT or pass -p PROJECT.")
+end
+
+def fetch_project_by_id(workspace_id, project_id)
+  http_get("workspaces/#{workspace_id}/projects/#{project_id}")
+end
+
+def fetch_entries(workspace_id, user_id, project_id, start_time, end_time)
+  entries = []
+  page = 1
+  loop do
+    batch = http_get("workspaces/#{workspace_id}/user/#{user_id}/time-entries", {
+      project:    project_id,
+      start:      iso8601_z(start_time),
+      end:        iso8601_z(end_time),
+      "page-size" => 200,
+      page:       page
+    })
+    break if batch.empty?
+    entries.concat(batch)
+    break if batch.size < 200
+    page += 1
+  end
+  entries
+end
+
+def find_running_entry(workspace_id, user_id)
+  entries = http_get("workspaces/#{workspace_id}/user/#{user_id}/time-entries", {
+    "in-progress" => true,
+    "page-size"   => 1
+  })
+  entries.first
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Time helpers
+
+def iso8601_z(time) = time.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def parse_iso8601_duration(str)
+  return 0 if str.nil? || str.empty?
+  m = str.match(/\APT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?\z/)
+  return 0 unless m
+  (m[1].to_i * 3600) + (m[2].to_i * 60) + m[3].to_f.to_i
+end
+
+def date_range(year, month, day)
+  if day
+    d = Date.new(year, month, day)
+    [d, d]
+  else
+    [Date.new(year, month, 1), Date.new(year, month, -1)]
+  end
+end
+
+def humanize_duration(seconds)
+  hrs  = (seconds / 3600).to_i
+  mins = ((seconds % 3600) / 60).to_i
+  parts = []
+  parts << "#{hrs}h"  if hrs.positive?
+  parts << "#{mins}m" if mins.positive? || parts.empty?
+  parts.join(" ")
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subcommand: log (report hours)
+
+def cmd_log
+  options = { month: Date.today.month, year: Date.today.year, day: nil, json: false, project: PROJECT_NAME }
+
+  parser = OptionParser.new do |opts|
+    opts.banner = <<~USAGE
+      Usage: clockify log [-m MM] [-y YYYY] [-d DD] [-p PROJECT] [--json]
+
+      Report hours for the given month (or single day) on the configured project.
+
+      Flags:
+    USAGE
+    opts.on("-m", "--month MM", Integer, "Month 1-12 (default: current)")           { |v| options[:month]   = v }
+    opts.on("-y", "--year YYYY", Integer, "Year (default: current)")                { |v| options[:year]    = v }
+    opts.on("-d", "--day DD",   Integer, "Single day of month")                     { |v| options[:day]     = v }
+    opts.on("-p", "--project NAME",      "Project name (default: #{PROJECT_NAME})") { |v| options[:project] = v }
+    opts.on(      "--json",              "Emit JSON keyed by ISO date")             { options[:json] = true }
+    opts.on("-h", "--help",              "Show this help")                          { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  user         = fetch_user
+  workspace_id = user.fetch("defaultWorkspace")
+  user_id      = user.fetch("id")
+
+  project = fetch_project(workspace_id, options[:project])
+
+  first_date, last_date = date_range(options[:year], options[:month], options[:day])
+
+  # Buffer the API query by 1 day on each side so timezone-shifted entries near
+  # month boundaries still get pulled in. We filter by local date below.
+  query_start = Time.utc(first_date.year, first_date.month, first_date.day) - 86_400
+  query_end   = Time.utc(last_date.year,  last_date.month,  last_date.day)  + (2 * 86_400)
+
+  entries = fetch_entries(workspace_id, user_id, project["id"], query_start, query_end)
+
+  totals = Hash.new(0)
+  entries.each do |entry|
+    interval     = entry["timeInterval"] || {}
+    duration_str = interval["duration"]
+    next if duration_str.nil? || duration_str.empty?  # skip running entries
+
+    local_date = Time.parse(interval["start"]).getlocal.to_date
+    next unless local_date.between?(first_date, last_date)
+
+    totals[local_date] += parse_iso8601_duration(duration_str)
+  end
+
+  if options[:json]
+    render_json(totals)
+  else
+    render_human(options, totals, first_date, last_date)
+  end
+end
+
+def render_human(opts, totals, first_date, last_date)
+  puts "#{Date::MONTHNAMES[opts[:month]]} #{opts[:year]} — #{opts[:project]}"
+  (first_date..last_date).each do |date|
+    hrs = (totals[date] / 3600.0).round(2)
+    puts format("Day %2d:  %5.2fh", date.day, hrs)
+  end
+  puts "─" * 18
+  total_hrs = (totals.values.sum / 3600.0).round(2)
+  puts format("Total:   %5.2fh", total_hrs)
+end
+
+def render_json(totals)
+  out = {}
+  totals.sort.each do |date, secs|
+    hrs = (secs / 3600.0).round(2)
+    out[date.iso8601] = hrs if hrs > 0
+  end
+  puts JSON.generate(out)
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Summary computation (current week + paycheck halves) — used by `day`/`week`/`status`
+
+def compute_summary(workspace_id, user_id, project_id)
+  today      = Date.today
+  # Sunday-start week. Date#wday: 0=Sun..6=Sat.
+  week_start = today - today.wday
+  week_end   = week_start + 6
+
+  # Semi-monthly pay periods: 1–15 and 16–EOM.
+  h1_start = Date.new(today.year, today.month, 1)
+  h1_end   = Date.new(today.year, today.month, 15)
+  h2_start = Date.new(today.year, today.month, 16)
+  h2_end   = Date.new(today.year, today.month, -1)
+
+  # One paginated fetch covering the union of every range we care about.
+  range_start = [week_start, h1_start].min
+  range_end   = [week_end,   h2_end  ].max
+  query_start = Time.utc(range_start.year, range_start.month, range_start.day) - 86_400
+  query_end   = Time.utc(range_end.year,   range_end.month,   range_end.day)   + (2 * 86_400)
+
+  entries = fetch_entries(workspace_id, user_id, project_id, query_start, query_end)
+
+  today_secs = 0
+  week_secs  = 0
+  h1_secs    = 0
+  h2_secs    = 0
+  entries.each do |entry|
+    interval  = entry["timeInterval"] || {}
+    start_str = interval["start"]
+    next if start_str.nil? || start_str.empty?
+
+    local_date   = Time.parse(start_str).getlocal.to_date
+    duration_str = interval["duration"]
+    secs =
+      if duration_str.nil? || duration_str.empty?
+        [Time.now - Time.parse(start_str), 0].max.to_i  # running entry
+      else
+        parse_iso8601_duration(duration_str)
+      end
+
+    today_secs += secs if local_date == today
+    week_secs  += secs if local_date.between?(week_start, week_end)
+    h1_secs    += secs if local_date.between?(h1_start,   h1_end)
+    h2_secs    += secs if local_date.between?(h2_start,   h2_end)
+  end
+
+  today_hrs = (today_secs / 3600.0).round(2)
+  week_hrs  = (week_secs  / 3600.0).round(2)
+  h1_hrs    = (h1_secs    / 3600.0).round(2)
+  h2_hrs    = (h2_secs    / 3600.0).round(2)
+
+  {
+    "day" => {
+      "date"  => today.iso8601,
+      "hours" => today_hrs
+    },
+    "week" => {
+      "start"     => week_start.iso8601,
+      "end"       => week_end.iso8601,
+      "hours"     => week_hrs,
+      "limit"     => WEEKLY_LIMIT,
+      "remaining" => [WEEKLY_LIMIT - week_hrs, 0].max.round(2)
+    },
+    "paycheck" => {
+      "rate" => HOURLY_RATE,
+      "first_half"  => { "start" => h1_start.iso8601, "end" => h1_end.iso8601,
+                         "hours" => h1_hrs, "dollars" => (h1_hrs * HOURLY_RATE).round(2) },
+      "second_half" => { "start" => h2_start.iso8601, "end" => h2_end.iso8601,
+                         "hours" => h2_hrs, "dollars" => (h2_hrs * HOURLY_RATE).round(2) }
+    }
+  }
+end
+
+def cmd_day
+  options = { json: false, refresh: false }
+
+  parser = OptionParser.new do |opts|
+    opts.banner = <<~USAGE
+      Usage: clockify day [--json] [--refresh]
+
+      Show today's hour total on the configured project.
+      Reads from the status cache (refreshed every #{CACHE_TTL}s by `status`).
+
+      Flags:
+    USAGE
+    opts.on(      "--json",    "Emit JSON with day block")         { options[:json] = true }
+    opts.on("-r", "--refresh", "Force API call, ignore cache TTL") { options[:refresh] = true }
+    opts.on("-h", "--help",    "Show this help")                   { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  cached = read_cache
+  data =
+    if options[:refresh] || !cache_fresh?(cached) || cached["day"].nil?
+      refresh_status
+    else
+      cached
+    end
+
+  day = data["day"] || {}
+
+  if options[:json]
+    puts JSON.generate({ "day" => day })
+  else
+    puts "Today #{Date.parse(day["date"]).strftime("%b %-d")}: " \
+         "#{format("%.2f", day["hours"])}h"
+  end
+end
+
+def cmd_week
+  options = { json: false, refresh: false }
+
+  parser = OptionParser.new do |opts|
+    opts.banner = <<~USAGE
+      Usage: clockify week [--json] [--refresh]
+
+      Show current-week hours and both halves of this month's paycheck.
+      Reads from the status cache (refreshed every #{CACHE_TTL}s by `status`).
+
+      Flags:
+    USAGE
+    opts.on(      "--json",    "Emit JSON with week + paycheck blocks") { options[:json] = true }
+    opts.on("-r", "--refresh", "Force API call, ignore cache TTL")      { options[:refresh] = true }
+    opts.on("-h", "--help",    "Show this help")                        { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  cached = read_cache
+  data =
+    if options[:refresh] || !cache_fresh?(cached) || cached["week"].nil?
+      refresh_status
+    else
+      cached
+    end
+
+  week     = data["week"]     || {}
+  paycheck = data["paycheck"] || {}
+  h1       = paycheck["first_half"]  || {}
+  h2       = paycheck["second_half"] || {}
+
+  if options[:json]
+    puts JSON.generate({ "week" => week, "paycheck" => paycheck })
+  else
+    puts "Week #{Date.parse(week["start"]).strftime("%b %-d")} – " \
+         "#{Date.parse(week["end"]).strftime("%b %-d")}: " \
+         "#{format("%.2f", week["hours"])}h  " \
+         "(#{format("%.2f", week["remaining"])}h until #{week["limit"]}h limit)"
+    puts "Paycheck:"
+    puts "  #{Date.parse(h1["start"]).strftime("%b %-d")}–" \
+         "#{Date.parse(h1["end"]).strftime("%b %-d")}: $#{format("%.2f", h1["dollars"])} " \
+         "(#{format("%.2f", h1["hours"])}h)"
+    puts "  #{Date.parse(h2["start"]).strftime("%b %-d")}–" \
+         "#{Date.parse(h2["end"]).strftime("%b %-d")}: $#{format("%.2f", h2["dollars"])} " \
+         "(#{format("%.2f", h2["hours"])}h)"
+  end
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subcommand: open (open Clockify web tracker in default browser)
+
+def cmd_open
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: clockify open"
+    opts.on("-h", "--help", "Show this help") { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  url = "https://app.clockify.me/tracker"
+  unless system("/usr/bin/open", url)
+    raise ClockifyError, "could not open #{url}"
+  end
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Status cache (consumed by mac menu bar tools — Hammerspoon/xbar/SwiftBar/etc.)
+
+def write_cache(data)
+  FileUtils_mkdir_p(File.dirname(CACHE_PATH))
+  File.write(CACHE_PATH, JSON.generate(data))
+rescue StandardError => e
+  warn "warning: could not write cache (#{e.message})"
+end
+
+# Patch updates onto the existing cache (preserves the summary block when
+# start/stop change only the running state).
+def merge_cache(updates)
+  existing = read_cache || {}
+  write_cache(existing.merge(updates))
+end
+
+def FileUtils_mkdir_p(dir)
+  # Avoid `require "fileutils"` for a one-liner. Walk up and mkdir each level.
+  return if File.directory?(dir)
+  FileUtils_mkdir_p(File.dirname(dir))
+  Dir.mkdir(dir) unless File.directory?(dir)
+end
+
+def read_cache
+  return nil unless File.exist?(CACHE_PATH)
+  JSON.parse(File.read(CACHE_PATH))
+rescue StandardError
+  nil
+end
+
+def cache_for_running(running, workspace_id)
+  project_id    = running["projectId"]
+  project_label = project_id ? fetch_project_by_id(workspace_id, project_id)["name"] : nil
+  {
+    "running"     => true,
+    "description" => running["description"].to_s,
+    "project"     => project_label,
+    "started_at"  => running["timeInterval"]["start"],
+    "fetched_at"  => iso8601_z(Time.now)
+  }
+end
+
+def cache_for_idle
+  { "running" => false, "fetched_at" => iso8601_z(Time.now) }
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Action helpers (shared by start / stop / punch)
+
+def start_entry(workspace_id, project_name, description)
+  project = fetch_project(workspace_id, project_name)
+  entry = http_post("workspaces/#{workspace_id}/time-entries", {
+    start:       iso8601_z(Time.now),
+    description: description,
+    projectId:   project["id"],
+    billable:    true
+  })
+  started_at = Time.parse(entry["timeInterval"]["start"]).getlocal.strftime("%H:%M")
+  desc_show  = description.empty? ? "(no description)" : description
+  puts "▶ Started #{desc_show} — #{project["name"]} at #{started_at}"
+  merge_cache({
+    "running"     => true,
+    "description" => description,
+    "project"     => project["name"],
+    "started_at"  => entry["timeInterval"]["start"],
+    "fetched_at"  => iso8601_z(Time.now)
+  })
+end
+
+def stop_entry(workspace_id, user_id, running)
+  http_patch("workspaces/#{workspace_id}/user/#{user_id}/time-entries", {
+    end: iso8601_z(Time.now)
+  })
+  start_t       = Time.parse(running["timeInterval"]["start"]).getlocal
+  end_t         = Time.now
+  duration_secs = end_t - start_t
+  desc          = running["description"].to_s
+  desc_show     = desc.empty? ? "(no description)" : desc
+  puts "■ Stopped #{desc_show} — #{humanize_duration(duration_secs)} " \
+       "(#{start_t.strftime("%H:%M")} → #{end_t.strftime("%H:%M")})"
+  merge_cache(cache_for_idle.merge({ "description" => nil, "project" => nil, "started_at" => nil }))
+end
+
+def prompt_yes_no(question)
+  $stdout.print "#{question} "
+  $stdout.flush
+  input = $stdin.gets
+  return false if input.nil?
+  answer = input.strip.downcase
+  answer.empty? || answer == "y" || answer == "yes"
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subcommand: start
+
+def cmd_start
+  options = { project: PROJECT_NAME, description: "" }
+
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: clockify start [-p PROJECT] [-d DESCRIPTION]"
+    opts.on("-p", "--project NAME",     "Project name (default: #{PROJECT_NAME})")  { |v| options[:project]     = v }
+    opts.on("-d", "--description TEXT", "Entry description (default: empty)")       { |v| options[:description] = v }
+    opts.on("-h", "--help",             "Show this help")                           { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  user         = fetch_user
+  workspace_id = user.fetch("defaultWorkspace")
+  user_id      = user.fetch("id")
+
+  if (running = find_running_entry(workspace_id, user_id))
+    started   = Time.parse(running["timeInterval"]["start"]).getlocal.strftime("%H:%M")
+    desc      = running["description"].to_s
+    desc_show = desc.empty? ? "(no description)" : desc.inspect
+    warn "error: an entry is already running — started at #{started}, description #{desc_show}"
+    warn "Run `clockify stop` first."
+    exit 1
+  end
+
+  start_entry(workspace_id, options[:project], options[:description])
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subcommand: stop
+
+def cmd_stop
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: clockify stop"
+    opts.on("-h", "--help", "Show this help") { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  user         = fetch_user
+  workspace_id = user.fetch("defaultWorkspace")
+  user_id      = user.fetch("id")
+
+  running = find_running_entry(workspace_id, user_id)
+  unless running
+    warn "warning: no entry currently running"
+    exit 1
+  end
+
+  stop_entry(workspace_id, user_id, running)
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subcommand: punch (smart toggle — confirms then starts or stops)
+
+def cmd_punch
+  options = { project: PROJECT_NAME, description: "", yes: false }
+
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: clockify punch [-p PROJECT] [-d DESCRIPTION] [-y]"
+    opts.on("-p", "--project NAME",     "Project name if starting (default: #{PROJECT_NAME})") { |v| options[:project]     = v }
+    opts.on("-d", "--description TEXT", "Description if starting (default: empty)")            { |v| options[:description] = v }
+    opts.on("-y", "--yes",              "Auto-confirm — toggle without prompting")             { options[:yes] = true }
+    opts.on("-h", "--help",             "Show this help")                                      { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  user         = fetch_user
+  workspace_id = user.fetch("defaultWorkspace")
+  user_id      = user.fetch("id")
+
+  running = find_running_entry(workspace_id, user_id)
+
+  if running
+    if options[:yes]
+      stop_entry(workspace_id, user_id, running)
+    else
+      start_t       = Time.parse(running["timeInterval"]["start"]).getlocal
+      duration_secs = Time.now - start_t
+      desc          = running["description"].to_s
+      desc_show     = desc.empty? ? "(no description)" : desc.inspect
+      project_id    = running["projectId"]
+      project_label = project_id ? fetch_project_by_id(workspace_id, project_id)["name"] : "(no project)"
+
+      question = "▶ #{desc_show} — #{project_label}, started #{start_t.strftime("%H:%M")} " \
+                 "(#{humanize_duration(duration_secs)}). Stop? [Y/n]"
+      stop_entry(workspace_id, user_id, running) if prompt_yes_no(question)
+    end
+  else
+    if options[:yes]
+      start_entry(workspace_id, options[:project], options[:description])
+    else
+      desc      = options[:description]
+      desc_show = desc.empty? ? "(no description)" : desc.inspect
+      question  = "No entry running. Start #{desc_show} on #{options[:project]}? [Y/n]"
+      start_entry(workspace_id, options[:project], options[:description]) if prompt_yes_no(question)
+    end
+  end
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subcommand: status (cached, designed for mac menu bar polling)
+
+def cmd_status
+  options = { json: false, mode: :auto }  # :auto | :refresh | :no_refresh
+
+  parser = OptionParser.new do |opts|
+    opts.banner = <<~USAGE
+      Usage: clockify status [--json] [--refresh | --no-refresh]
+
+      Print current Clockify status. Reads from cache at #{CACHE_PATH}
+      and auto-refreshes from the API if older than #{CACHE_TTL / 60} minutes.
+
+      Flags:
+    USAGE
+    opts.on(      "--json",        "Emit JSON (for menu bar parsing)") { options[:json] = true }
+    opts.on("-r", "--refresh",     "Force API call, ignore cache TTL") { options[:mode] = :refresh }
+    opts.on(      "--no-refresh",  "Read cache only, never hit API")   { options[:mode] = :no_refresh }
+    opts.on("-h", "--help",        "Show this help")                   { puts opts; exit 0 }
+  end
+
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    exit 2
+  end
+
+  cached = read_cache
+  fresh  = cache_fresh?(cached)
+  data =
+    case options[:mode]
+    when :no_refresh then cached
+    when :refresh    then refresh_status
+    else (fresh ? cached : refresh_status)
+    end
+
+  render_status(data, options[:json])
+end
+
+def cache_fresh?(cached)
+  return false unless cached && cached["fetched_at"]
+  (Time.now - Time.parse(cached["fetched_at"])) < CACHE_TTL
+rescue StandardError
+  false
+end
+
+def refresh_status
+  user         = fetch_user
+  workspace_id = user.fetch("defaultWorkspace")
+  user_id      = user.fetch("id")
+  running      = find_running_entry(workspace_id, user_id)
+  data         = running ? cache_for_running(running, workspace_id) : cache_for_idle
+
+  # Bake week + paycheck totals into the cache so the menu bar can read them
+  # without hitting the API itself. Failures here shouldn't break the status
+  # refresh — keep the running/idle data intact and move on.
+  begin
+    project = fetch_project(workspace_id, PROJECT_NAME)
+    data.merge!(compute_summary(workspace_id, user_id, project["id"]))
+  rescue ClockifyError => e
+    warn "warning: could not compute summary (#{e.message})"
+  end
+
+  write_cache(data)
+  data
+end
+
+def render_status(data, as_json)
+  if as_json
+    puts JSON.generate(data || { "running" => false })
+    return
+  end
+
+  if data.nil?
+    puts "■ unknown (no cache)"
+    return
+  end
+
+  if data["running"]
+    elapsed   = Time.now - Time.parse(data["started_at"])
+    desc      = data["description"].to_s
+    desc_show = desc.empty? ? "(no description)" : desc
+    puts "▶ #{desc_show} — #{humanize_duration(elapsed)}"
+  else
+    puts "■ idle"
+  end
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subcommand: help
+
+def cmd_help
+  puts <<~USAGE
+    clockify — Clockify time-tracking CLI
+
+    Usage:
+      clockify                                              Show this help
+      clockify log   [-m MM] [-y YYYY] [-d DD] [--json]     Report hours
+      clockify start [-p PROJECT] [-d DESCRIPTION]          Clock in
+      clockify stop                                         Clock out
+      clockify punch [-p PROJECT] [-d DESCRIPTION] [-y]     Smart toggle: prompts to start or stop (-y to skip prompt)
+      clockify status [--json] [--refresh | --no-refresh]   Cached status (for mac menu bar)
+      clockify day   [--json]                               Today's hour total
+      clockify week  [--json]                               Current-week hour total + paycheck halves
+      clockify open                                         Open https://app.clockify.me/tracker
+
+    Configured project: #{PROJECT_NAME} (override with -p or $CLOCKIFY_PROJECT)
+
+    Run any subcommand with -h for its own flags.
+  USAGE
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+
+def main
+  case ARGV.first
+  when nil, "-h", "--help" then cmd_help
+  when "log"   then ARGV.shift; cmd_log
+  when "start" then ARGV.shift; cmd_start
+  when "stop"  then ARGV.shift; cmd_stop
+  when "punch"  then ARGV.shift; cmd_punch
+  when "status" then ARGV.shift; cmd_status
+  when "day"    then ARGV.shift; cmd_day
+  when "week"   then ARGV.shift; cmd_week
+  when "open"   then ARGV.shift; cmd_open
+  else
+    warn "error: unknown subcommand: #{ARGV.first.inspect}"
+    warn "Run `clockify --help` to see available commands."
+    exit 2
+  end
+rescue ClockifyError => e
+  warn "error: #{e.message}"
+  exit 1
+rescue Errno::ECONNREFUSED, SocketError, Net::OpenTimeout, Net::ReadTimeout => e
+  warn "network error: #{e.message}"
+  exit 1
+end
+
+main

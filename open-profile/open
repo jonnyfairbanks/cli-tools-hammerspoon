@@ -1,0 +1,69 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Drop-in wrapper around macOS `open(1)` that adds `-p PROFILE` for forcing a
+# specific Chrome profile. Without `-p`, args are passed through to
+# `/usr/bin/open` unchanged.
+#
+# Usage:
+#   open https://example.com                      # passthrough to /usr/bin/open
+#   open -p you@work.com https://...              # force profile by email
+#   open -p "Profile 1" https://...               # by directory name
+#   open -p "Work" https://...                    # by display name
+#   open -p you@work.com /tmp/foo.html            # local file, in profile
+#
+# Used by `log-work --open` so the generated HTML timesheet lands in a
+# specific Chrome profile (Finicky only routes http/https URLs, not local
+# files). For URL routing in general, prefer Finicky.
+#
+# `-p`'s value may be a profile directory ("Profile 1"), display name
+# ("Work"), or signed-in account email ("you@work.com"). All resolutions are
+# case-insensitive and read Chrome's Local State JSON.
+
+require "json"
+
+SYSTEM_OPEN = "/usr/bin/open"
+LOCAL_STATE = File.expand_path("~/Library/Application Support/Google/Chrome/Local State")
+
+def passthrough!
+  exec(SYSTEM_OPEN, *ARGV)
+end
+
+# Find -p anywhere in ARGV; if missing, just hand off to /usr/bin/open.
+idx = ARGV.index("-p") || ARGV.index("--profile")
+passthrough! unless idx
+
+profile_query = ARGV[idx + 1]
+if profile_query.nil? || profile_query.empty?
+  warn "open: -p requires a value (profile directory, display name, or email)"
+  exit 2
+end
+
+unless File.exist?(LOCAL_STATE)
+  warn "open: cannot read Chrome Local State at #{LOCAL_STATE}"
+  exit 1
+end
+
+state = JSON.parse(File.read(LOCAL_STATE))
+profiles = state.dig("profile", "info_cache") || {}
+
+q = profile_query.downcase
+match = profiles.find do |dir, info|
+  [dir, info["user_name"], info["name"]].compact.any? { |s| s.downcase == q }
+end
+
+unless match
+  warn "open: no Chrome profile matching #{profile_query.inspect}"
+  warn "  known profiles:"
+  profiles.each do |dir, info|
+    warn "    #{dir.ljust(12)} #{info["user_name"] || "?"}  (#{info["name"] || "?"})"
+  end
+  exit 1
+end
+
+profile_dir = match[0]
+rest = ARGV.dup
+rest.slice!(idx, 2)
+
+exec(SYSTEM_OPEN, "-na", "Google Chrome", "--args",
+     "--profile-directory=#{profile_dir}", *rest)

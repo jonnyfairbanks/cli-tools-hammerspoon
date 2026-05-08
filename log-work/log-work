@@ -1,0 +1,619 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# log-work — build a month-shaped HTML timesheet from git + Clockify
+#
+# Combines `git log` (commits authored by you on origin/main) with
+# `clockify log --json` (hours per day) into a paste-ready HTML table at
+# /tmp/log-work-YYYY-MM.html.
+#
+# Usage:
+#   log-work                          # current month, current dir
+#   log-work 2026-04                  # specific month
+#   log-work --month 2026-03 --repo ~/dev/some-repo
+#   log-work --json                   # emit summary JSON to stdout (for LLMs)
+#   log-work --open                   # also open the HTML in default browser
+
+require "json"
+require "date"
+require "optparse"
+require "shellwords"
+require "fileutils"
+
+# ── EDIT ME ────────────────────────────────────────────────────────────────────
+# Defaults (also overridable via env vars or CLI flags).
+AUTHOR                 = ENV["LOG_WORK_AUTHOR"]                 # required — e.g. "Jane Doe"
+SHEET_URL              = ENV["LOG_WORK_SHEET_URL"]              || ""  # optional Google Sheet to link in the report header
+CHROME_PROFILE_ACCOUNT = ENV["LOG_WORK_CHROME_PROFILE"]         || nil # email/profile name; passed to ../open-profile/open
+HOURLY_RATE            = (ENV["LOG_WORK_HOURLY_RATE"]           || "0").to_f    # USD/hour (0 = no $ figures)
+WEEKLY_CAP             = (ENV["LOG_WORK_WEEKLY_CAP"]            || "30").to_f   # status icons against this cap
+WEEKLY_WARN            = (ENV["LOG_WORK_WEEKLY_WARN"]           || "25").to_f
+DAY_31_DEFAULT_BULLET  = ENV["LOG_WORK_DEFAULT_BULLET"]         || "Filler"
+DAY_31_DEFAULT_HOURS   = (ENV["LOG_WORK_DEFAULT_HOURS"]         || "0").to_f
+# `--open` looks for ../open-profile/open relative to this script (so the
+# generated HTML opens in the right Chrome profile). Override if you put the
+# helper elsewhere.
+OPEN_PROFILE = ENV["LOG_WORK_OPEN_PROFILE"] ||
+               File.expand_path("../../open-profile/open", File.realpath(__FILE__))
+# ───────────────────────────────────────────────────────────────────────────────
+
+if AUTHOR.nil? || AUTHOR.strip.empty?
+  warn "error: LOG_WORK_AUTHOR is not set."
+  warn "        Add `export LOG_WORK_AUTHOR=\"Your Name\"` to ~/.zshrc — must match your git author name."
+  exit 2
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Args
+
+options = { repo: Dir.pwd, month: nil, emit_json: false, open: false }
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: log-work [MONTH] [options]\n  MONTH: YYYY-MM (default: current month)"
+  o.on("--month YYYY-MM", "Target month") { |v| options[:month] = v }
+  o.on("--repo PATH", "Git repo path (default: cwd)") { |v| options[:repo] = File.expand_path(v) }
+  o.on("--json", "Emit summary JSON on stdout (for LLM consumers)") { options[:emit_json] = true }
+  o.on("--open", "Open the HTML file in default browser when done") { options[:open] = true }
+  o.on("-h", "--help") { puts o; exit 0 }
+end
+parser.parse!
+
+# Positional MONTH wins if --month not given
+if options[:month].nil? && (pos = ARGV.shift)
+  options[:month] = pos
+end
+
+today = Date.today
+year, month =
+  if options[:month].nil?
+    [today.year, today.month]
+  elsif options[:month] =~ /\A(\d{4})-(\d{1,2})\z/
+    [$1.to_i, $2.to_i]
+  else
+    warn "error: MONTH must be YYYY-MM (got: #{options[:month].inspect})"
+    exit 2
+  end
+
+unless (1..12).include?(month)
+  warn "error: invalid month #{month}"
+  exit 2
+end
+
+repo = options[:repo]
+unless File.directory?(File.join(repo, ".git"))
+  warn "error: not a git repository: #{repo}"
+  exit 2
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Git
+
+def git_commits(repo:, year:, month:, author:, until_date:)
+  start = format("%04d-%02d-01 00:00:00", year, month)
+  finish = "#{until_date} 23:59:59"
+  fmt = "%cd|%h|%s"
+  cmd = [
+    "git", "-C", repo, "log",
+    "--author=#{author}",
+    "--since=#{start}",
+    "--until=#{finish}",
+    "--no-merges",
+    "--pretty=format:#{fmt}",
+    "--date=format:%Y-%m-%d",
+    "origin/main"
+  ]
+  raw = IO.popen(cmd, &:read)
+  raise "git log failed (exit #{$?.exitstatus})" unless $?.success?
+
+  by_date = Hash.new { |h, k| h[k] = [] }
+  raw.each_line do |line|
+    date, sha, subject = line.strip.split("|", 3)
+    next if date.nil? || subject.nil?
+    by_date[date] << { sha: sha, subject: subject }
+  end
+  by_date.each_value(&:reverse!)
+  by_date
+end
+
+system("git", "-C", repo, "fetch", "origin", "--quiet", out: File::NULL, err: File::NULL)
+
+last_day_of_month = Date.new(year, month, -1)
+end_date =
+  if year == today.year && month == today.month
+    today.strftime("%Y-%m-%d")
+  else
+    last_day_of_month.strftime("%Y-%m-%d")
+  end
+
+git_by_date = git_commits(repo: repo, year: year, month: month, author: AUTHOR, until_date: end_date)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clockify
+
+def clockify_hours(year:, month:)
+  raw = IO.popen(["clockify", "log", "--json", "-m", month.to_s, "-y", year.to_s], err: [:child, :out], &:read)
+  return { ok: false, data: {}, error: "clockify exited #{$?.exitstatus}: #{raw.strip}" } unless $?.success?
+  parsed = JSON.parse(raw)
+  unless parsed.is_a?(Hash)
+    return { ok: false, data: {}, error: "clockify returned non-hash: #{parsed.inspect}" }
+  end
+  { ok: true, data: parsed, error: nil }
+rescue Errno::ENOENT
+  { ok: false, data: {}, error: "clockify CLI not found on PATH" }
+rescue JSON::ParserError => e
+  { ok: false, data: {}, error: "clockify JSON parse error: #{e.message}" }
+end
+
+clockify_result = clockify_hours(year: year, month: month)
+
+def round_down_tenth(h)
+  ((h.to_f / 0.1).floor) * 0.1
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bullet formatting
+
+def commit_to_bullet(subject)
+  s = subject.sub(/\s*\(#\d+\)\s*\z/, "")
+  if (m = s.match(/\A\[([^\]]+)\]\s*(.+)\z/))
+    "- [#{m[1]}] #{m[2]}"
+  else
+    "- #{s}"
+  end
+end
+
+def esc(s)
+  s.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Build per-day rows (always 31 rows)
+#
+# The 31st row stays in even for shorter months — useful for sheets that always
+# have a row 31. By default the filler is empty (DAY_31_DEFAULT_HOURS = 0); set
+# LOG_WORK_DEFAULT_BULLET / LOG_WORK_DEFAULT_HOURS to baseline-fill it.
+
+month_label = Date.new(year, month, 1).strftime("%B %Y")
+first_day_of_month = Date.new(year, month, 1)
+last_day_of_month_d = Date.new(year, month, -1)
+
+active_days = []
+empty_days = []
+days_data = []
+
+(1..31).each do |day|
+  date = (Date.new(year, month, day) rescue nil)
+  iso = date&.strftime("%Y-%m-%d")
+  commits = iso ? git_by_date[iso] : []
+  bullets = commits.map { |c| commit_to_bullet(c[:subject]) }
+
+  raw_hours = (iso && clockify_result[:data][iso]) ? clockify_result[:data][iso].to_f : nil
+  hours = raw_hours ? round_down_tenth(raw_hours) : nil
+
+  defaults_applied = []
+  if day == 31 && bullets.empty? && hours.nil? && DAY_31_DEFAULT_HOURS > 0
+    bullets = ["- #{DAY_31_DEFAULT_BULLET}"]
+    hours = DAY_31_DEFAULT_HOURS
+    defaults_applied = [:bullet, :hours]
+  end
+
+  if bullets.any? || hours
+    active_days << day
+  else
+    empty_days << day
+  end
+
+  days_data << {
+    day: day,
+    iso: iso,
+    in_month: !date.nil?,
+    commits: commits,
+    bullets: bullets,
+    hours_raw: raw_hours,
+    hours: hours,
+    defaults_applied: defaults_applied
+  }
+end
+
+csv_hours_by_iso = days_data.each_with_object({}) do |d, h|
+  h[d[:iso]] = d[:hours] if d[:in_month] && d[:hours]
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Weekly hours calendar (Sun–Sat)
+
+def week_start(date)
+  date - date.wday  # wday 0 = Sunday
+end
+
+calendar_weeks = []
+cursor = week_start(first_day_of_month)
+while cursor <= last_day_of_month_d
+  calendar_weeks << (0..6).map { |i| cursor + i }
+  cursor += 7
+end
+
+neighbour_months = calendar_weeks.flatten
+  .map { |d| [d.year, d.month] }
+  .uniq
+  .reject { |y, m| y == year && m == month }
+
+neighbour_hours = {}
+neighbour_months.each do |y, m|
+  res = clockify_hours(year: y, month: m)
+  next unless res[:ok]
+  res[:data].each { |k, v| neighbour_hours[k] = round_down_tenth(v.to_f) }
+end
+
+day_hours_lookup = ->(date) {
+  iso = date.strftime("%Y-%m-%d")
+  if date.year == year && date.month == month
+    csv_hours_by_iso[iso] || 0.0
+  else
+    neighbour_hours[iso] || 0.0
+  end
+}
+
+weeks_data = calendar_weeks.map do |dates|
+  total = dates.sum { |d| day_hours_lookup.call(d) }.round(1)
+  status =
+    if total > WEEKLY_CAP then :over
+    elsif total >= WEEKLY_WARN then :warn
+    else :ok
+    end
+  { dates: dates, total: total, status: status }
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Paycheck periods: 1st–15th and 16th–end-of-month.
+
+sum_period = ->(range) {
+  days_data.select { |d| range.include?(d[:day]) }.sum { |d| d[:hours] || 0.0 }
+}
+
+period_1_hours = sum_period.call(1..15).round(1)
+period_2_hours = sum_period.call(16..31).round(1)
+total_paycheck_hours = (period_1_hours + period_2_hours).round(1)
+
+month_short = first_day_of_month.strftime("%b")
+period_1_label = "#{month_short} 1–#{month_short} 15"
+period_2_label = "#{month_short} 16–#{month_short} #{last_day_of_month_d.day}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTML
+
+def fmt_hours(h)
+  s = format("%.1f", h)
+  s.sub(/\.0\z/, "")
+end
+
+calendar_rows_html = weeks_data.map do |w|
+  icon, klass = case w[:status]
+                when :over then ["❌", "week-over"]
+                when :warn then ["⚠️", "week-warn"]
+                else            ["✅", "week-ok"]
+                end
+  cells = w[:dates].map do |d|
+    day_hours = day_hours_lookup.call(d)
+    hrs_str = day_hours > 0 ? fmt_hours(day_hours) : ""
+    in_target = d.year == year && d.month == month
+    cls = in_target ? "cal-day" : "cal-day cal-out"
+    %Q(<td class="#{cls}"><div class="cal-day-num">#{d.day}</div><div class="cal-day-hours">#{hrs_str}</div></td>)
+  end.join
+  <<~ROW
+    <tr class="#{klass}">
+      <td class="cal-status">#{icon} #{fmt_hours(w[:total])}/#{fmt_hours(WEEKLY_CAP)}hrs</td>
+      #{cells}
+    </tr>
+  ROW
+end.join
+
+calendar_html = <<~CAL
+  <div class="calendar">
+    <div class="calendar-subtitle">Weekly hours (cap #{fmt_hours(WEEKLY_CAP)}h/wk)</div>
+    <table class="cal-table">
+      <thead>
+        <tr>
+          <th class="cal-status-h"></th>
+          <th class="cal-month" colspan="7">#{month_label}</th>
+        </tr>
+        <tr>
+          <th class="cal-status-h"></th>
+          <th>Su</th><th>Mo</th><th>Tu</th><th>We</th><th>Th</th><th>Fr</th><th>Sa</th>
+        </tr>
+      </thead>
+      <tbody>
+#{calendar_rows_html}    </tbody>
+    </table>
+  </div>
+CAL
+
+rows_html = days_data.map do |d|
+  details_html = d[:bullets].map { |b| esc(b) }.join("\n")
+  hrs_str = d[:hours] ? format("%.2f", d[:hours]) : ""
+  <<~ROW
+    <tr>
+      <td></td>
+      <td class="col-day">#{d[:day]}</td>
+      <td class="col-details" contenteditable="plaintext-only">#{details_html}</td>
+      <td class="col-hours" contenteditable="plaintext-only">#{hrs_str}</td>
+      <td class="col-actions no-copy"><button class="copy-btn" data-copy-row>Copy</button></td>
+    </tr>
+  ROW
+end.join
+
+clockify_warning = clockify_result[:ok] ? "" : <<~WARN
+  <div class="warning"><strong>⚠ Clockify hours unavailable:</strong> #{esc(clockify_result[:error])}</div>
+WARN
+
+sheet_link_html =
+  if SHEET_URL.empty?
+    ""
+  else
+    %Q(Click <em>Copy</em> on a row, then paste into the matching row in the
+        <a class="sheet-link" target="_blank" rel="noopener" href="#{esc(SHEET_URL)}">hours sheet</a>.
+        Cells are editable — tweak before copying.)
+  end
+
+html = <<~HTML
+  <!doctype html>
+  <html lang="en">
+  <head>
+  <meta charset="utf-8">
+  <title>Log Work — #{month_label}</title>
+  <style>
+    :root { --bg:#0f1115; --panel:#181b22; --panel-2:#1f232c; --border:#2a2f3a;
+            --text:#e6e9ef; --muted:#8a93a6; --accent:#6ea8fe; --ok:#45c47c; --warn:#e0a44a; --err:#e06262; }
+    * { box-sizing: border-box; }
+    body { margin:0; padding:32px 24px 64px; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    header,main { max-width:1100px; margin:0 auto; }
+    header { margin-bottom:20px; display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+    h1 { font-size:20px; margin:0 0 6px; font-weight:600; }
+    .subtitle { color:var(--muted); font-size:13px; }
+    .sheet-link { color:var(--accent); text-decoration:none; }
+    .sheet-link:hover { text-decoration:underline; }
+    header { margin-bottom:28px; }
+    .warning { margin-bottom:20px; padding:12px 14px; background:rgba(224,164,74,0.1); border:1px solid var(--warn); border-radius:8px; color:var(--warn); font-size:13px; }
+    main > * + * { margin-top:24px; }
+    table { width:100%; border-collapse:separate; border-spacing:0; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+    th,td { padding:12px 14px; text-align:left; vertical-align:top; border-bottom:1px solid var(--border); }
+    tbody tr:last-child td { border-bottom:none; }
+    th { background:var(--panel-2); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.4px; color:var(--muted); }
+    td.col-day { width:64px; font-variant-numeric:tabular-nums; color:var(--muted); white-space:nowrap; }
+    td.col-details { font:13px/1.55 ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace; white-space:pre-wrap; word-break:break-word; }
+    td.col-details:focus, td.col-hours:focus { outline:2px solid var(--accent); outline-offset:-2px; }
+    td.col-hours { width:90px; font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap; }
+    td.col-actions { width:110px; text-align:right; white-space:nowrap; }
+    .copy-btn { appearance:none; border:1px solid var(--accent); background:transparent; color:var(--accent); padding:5px 10px; border-radius:6px; font-size:12px; font-weight:500; cursor:pointer; transition:all 120ms ease; }
+    .copy-btn:hover { background:var(--accent); color:#0b1220; }
+    .copy-btn.copied { border-color:var(--ok); color:var(--ok); background:transparent; }
+    .copy-all-btn { padding:8px 14px; font-size:13px; }
+    .header-buttons { display:flex; gap:8px; flex-wrap:wrap; }
+    .summary { padding:14px 18px; background:var(--panel); border:1px solid var(--border); border-radius:10px; color:var(--muted); font-size:13px; line-height:1.7; }
+    .summary strong { color:var(--text); }
+    .totals { padding:16px 18px; background:var(--panel); border:1px solid var(--border); border-radius:10px; color:var(--text); font-size:14px; font-variant-numeric:tabular-nums; }
+    main > .totals { margin-top:14px; }
+    .totals-row { padding:4px 0; }
+    .totals-row + .totals-row { border-top:1px solid var(--border); margin-top:6px; padding-top:10px; }
+    .totals-label { color:var(--muted); text-transform:uppercase; font-size:12px; letter-spacing:0.4px; margin-right:8px; }
+    .paycheck-period { display:inline-block; margin-right:18px; }
+    .calendar { padding:20px 24px; background:var(--panel); border:1px solid var(--border); border-radius:10px; }
+    .calendar-subtitle { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:0.4px; margin-bottom:14px; text-align:center; }
+    .cal-table th.cal-month { color:var(--text); font-size:15px; font-weight:600; text-transform:none; padding:4px 8px 12px; }
+    .cal-table { width:auto; margin:0 auto; background:transparent; border:none; border-radius:0; border-collapse:collapse; border-spacing:0; overflow:visible; }
+    .cal-table th, .cal-table td { padding:6px 12px; text-align:center; vertical-align:middle; border:none; font-variant-numeric:tabular-nums; font-size:13px; }
+    .cal-table th { background:transparent; color:var(--muted); text-transform:none; letter-spacing:0; font-weight:500; font-size:12px; padding-bottom:10px; }
+    .cal-table td.cal-status { text-align:right; padding-right:18px; white-space:nowrap; min-width:140px; font-size:13px; }
+    .cal-table td.cal-day { color:var(--text); width:52px; padding:6px 10px; }
+    .cal-day-num { font-size:14px; line-height:1.2; font-weight:500; }
+    .cal-day-hours { font-size:11px; color:var(--muted); min-height:14px; line-height:1.2; margin-top:2px; }
+    .cal-table td.cal-out .cal-day-num { color:var(--border); font-weight:400; }
+    .cal-table td.cal-out .cal-day-hours { color:var(--border); }
+    tr.week-ok td.cal-status { color:var(--ok); }
+    tr.week-warn td.cal-status { color:var(--warn); }
+    tr.week-over td.cal-status { color:var(--err); }
+  </style>
+  </head>
+  <body>
+  <header>
+    <div>
+      <h1>Log Work — #{month_label}</h1>
+      <div class="subtitle">#{sheet_link_html}</div>
+    </div>
+    <div class="header-buttons">
+      <button class="copy-btn copy-all-btn" id="copy-1-15">Copy 1–15</button>
+      <button class="copy-btn copy-all-btn" id="copy-16-end">Copy 16–#{last_day_of_month_d.day}</button>
+      <button class="copy-btn copy-all-btn" id="copy-all">Copy all rows</button>
+    </div>
+  </header>
+
+  <main>
+  #{clockify_warning}#{calendar_html}
+  <div class="summary">
+    <strong>Days with activity:</strong> #{active_days.length} (#{active_days.join(", ")})<br>
+    <strong>Days with no data:</strong> #{empty_days.length} (#{empty_days.join(", ")})
+  </div>
+
+  <div class="totals">
+    <div class="totals-row"><span class="totals-label">Total:</span> #{fmt_hours(total_paycheck_hours)}h</div>
+    <div class="totals-row"><span class="totals-label">Paycheck:</span>
+      <span class="paycheck-period">#{period_1_label}: $#{format("%.2f", period_1_hours * HOURLY_RATE)} (#{fmt_hours(period_1_hours)}h)</span>
+      <span class="paycheck-period">#{period_2_label}: $#{format("%.2f", period_2_hours * HOURLY_RATE)} (#{fmt_hours(period_2_hours)}h)</span>
+    </div>
+  </div>
+
+  <table id="report">
+    <thead>
+      <tr>
+        <th></th>
+        <th>Day</th>
+        <th>Work Details</th>
+        <th>Hours</th>
+        <th class="no-copy"></th>
+      </tr>
+    </thead>
+    <tbody>
+  #{rows_html}    </tbody>
+  </table>
+  </main>
+
+  <script>
+    function rowsToHtml(rows) {
+      const t = document.createElement("table");
+      const tb = document.createElement("tbody");
+      rows.forEach(tr => {
+        const clone = tr.cloneNode(true);
+        clone.querySelectorAll(".no-copy").forEach(n => n.remove());
+        clone.querySelectorAll("[contenteditable]").forEach(n => n.removeAttribute("contenteditable"));
+        tb.appendChild(clone);
+      });
+      t.appendChild(tb);
+      return t.outerHTML;
+    }
+
+    function rowsToText(rows) {
+      return rows.map(tr => {
+        const tds = Array.from(tr.children);
+        return tds.map(td => {
+          if (td.classList.contains("no-copy")) return null;
+          const raw = (td.classList.contains("col-details") ? td.innerText : td.textContent).trim();
+          if (td.classList.contains("col-details")) {
+            return '"' + raw.replace(/"/g, '""') + '"';
+          }
+          return raw;
+        }).filter(v => v !== null).join("\\t");
+      }).join("\\n");
+    }
+
+    async function copyHtml(html, text, btn) {
+      try {
+        const item = new ClipboardItem({
+          "text/html":  new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([text], { type: "text/plain" })
+        });
+        await navigator.clipboard.write([item]);
+        flash(btn, "Copied ✓");
+      } catch (err) {
+        try { await navigator.clipboard.writeText(text); flash(btn, "Copied ✓"); }
+        catch (e2) { flash(btn, "Copy failed", true); console.error(e2); }
+      }
+    }
+
+    function flash(btn, msg, isError = false) {
+      const original = btn.textContent;
+      btn.textContent = msg;
+      if (!isError) btn.classList.add("copied");
+      setTimeout(() => { btn.textContent = original; btn.classList.remove("copied"); }, 1400);
+    }
+
+    document.querySelectorAll("[data-copy-row]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const tr = btn.closest("tr");
+        copyHtml(rowsToHtml([tr]), rowsToText([tr]), btn);
+      });
+    });
+
+    function rowsInDayRange(start, end) {
+      return Array.from(document.querySelectorAll("#report tbody tr")).filter(tr => {
+        const dayCell = tr.querySelector(".col-day");
+        if (!dayCell) return false;
+        const day = parseInt(dayCell.textContent.trim(), 10);
+        return Number.isFinite(day) && day >= start && day <= end;
+      });
+    }
+
+    function wireRangeButton(id, start, end) {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      btn.addEventListener("click", () => {
+        const rows = rowsInDayRange(start, end);
+        copyHtml(rowsToHtml(rows), rowsToText(rows), btn);
+      });
+    }
+
+    wireRangeButton("copy-1-15", 1, 15);
+    wireRangeButton("copy-16-end", 16, 31);
+
+    const copyAllBtn = document.getElementById("copy-all");
+    if (copyAllBtn) {
+      copyAllBtn.addEventListener("click", () => {
+        const rows = Array.from(document.querySelectorAll("#report tbody tr"));
+        copyHtml(rowsToHtml(rows), rowsToText(rows), copyAllBtn);
+      });
+    }
+  </script>
+  </body>
+  </html>
+HTML
+
+out_path = "/tmp/log-work-#{format("%04d-%02d", year, month)}.html"
+File.write(out_path, html)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Output
+
+total_commits = days_data.sum { |d| d[:commits].length }
+total_hours = days_data.sum { |d| d[:hours] || 0.0 }
+top_day = days_data.max_by { |d| d[:commits].length }
+
+summary = {
+  month: format("%04d-%02d", year, month),
+  month_label: month_label,
+  repo: repo,
+  author: AUTHOR,
+  html_path: out_path,
+  totals: {
+    days_with_activity: active_days.length,
+    days_empty: empty_days.length,
+    total_commits: total_commits,
+    total_hours: total_hours.round(2),
+    busiest_day: top_day && top_day[:commits].any? ? { day: top_day[:day], commits: top_day[:commits].length } : nil
+  },
+  clockify: { ok: clockify_result[:ok], error: clockify_result[:error] },
+  weekly_cap: WEEKLY_CAP,
+  hourly_rate: HOURLY_RATE,
+  paycheck: {
+    period_1: { label: period_1_label, hours: period_1_hours, pay: (period_1_hours * HOURLY_RATE).round(2) },
+    period_2: { label: period_2_label, hours: period_2_hours, pay: (period_2_hours * HOURLY_RATE).round(2) },
+    total_hours: total_paycheck_hours,
+    total_pay: (total_paycheck_hours * HOURLY_RATE).round(2)
+  },
+  weeks: weeks_data.map { |w|
+    {
+      start: w[:dates].first.strftime("%Y-%m-%d"),
+      end: w[:dates].last.strftime("%Y-%m-%d"),
+      total_hours: w[:total],
+      status: w[:status].to_s
+    }
+  },
+  active_days: active_days,
+  empty_days: empty_days,
+  days: days_data.map { |d|
+    {
+      day: d[:day],
+      iso: d[:iso],
+      hours: d[:hours],
+      hours_raw: d[:hours_raw],
+      defaults_applied: d[:defaults_applied].map(&:to_s),
+      commits: d[:commits].map { |c| { sha: c[:sha], subject: c[:subject], bullet: commit_to_bullet(c[:subject]) } }
+    }
+  }
+}
+
+if options[:emit_json]
+  puts JSON.pretty_generate(summary)
+else
+  warn "Wrote #{out_path}"
+  warn "  #{active_days.length} days with activity, #{empty_days.length} empty"
+  warn "  #{total_commits} commits, #{format("%.2f", total_hours)} hours"
+  warn "  Clockify: #{clockify_result[:ok] ? "ok" : "FAILED — #{clockify_result[:error]}"}"
+  puts out_path
+end
+
+if options[:open]
+  if CHROME_PROFILE_ACCOUNT && File.executable?(OPEN_PROFILE)
+    system(OPEN_PROFILE, "-p", CHROME_PROFILE_ACCOUNT, out_path)
+  else
+    system("/usr/bin/open", out_path)
+  end
+end
