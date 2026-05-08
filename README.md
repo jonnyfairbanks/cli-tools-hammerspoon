@@ -45,6 +45,79 @@ flag for forcing a specific Chrome profile. Used by `log-work --open` so
 the local HTML report lands in the right profile (Finicky only routes
 http/https URLs, not local files).
 
+## How it fits together
+
+```mermaid
+flowchart TD
+    User([User])
+
+    subgraph hs["Hammerspoon (menu bar)"]
+        Apps["apps.lua<br/>▾ launcher"]
+        Tracker["tracker/init.lua<br/>TT ▶ 2.5h"]
+        LogworkLua["tracker/logwork.lua"]
+    end
+
+    subgraph cli["CLIs in ~/.local/bin"]
+        Clockify["clockify (Ruby)"]
+        LogWork["log-work (Ruby)"]
+        OpenProfile["open-profile<br/>(open -p PROFILE)"]
+    end
+
+    Cache[("~/.cache/clockify/<br/>status.json<br/>60s TTL")]
+    HTML[("/tmp/log-work-YYYY-MM.html")]
+
+    ClockifyAPI[(Clockify REST API)]
+    Git[(git log on origin/main)]
+    Finicky["Finicky<br/>default browser"]
+    Chrome[Chrome profiles]
+
+    %% User entry points
+    User -->|click ▾| Apps
+    User -->|click menu| Tracker
+    User -->|⌘⌃P hotkey| Tracker
+    User -->|terminal| Clockify
+    User -->|terminal| LogWork
+
+    %% Apps launcher
+    Apps -->|launchOrFocus| Chrome
+
+    %% Tracker widget flows
+    Tracker -->|"poll every 60s<br/>(status --json)"| Clockify
+    Tracker -.reads.-> Cache
+    Tracker -->|"Punch (punch -y)"| Clockify
+    Tracker -->|"Generate timesheet"| LogworkLua
+    Tracker -->|"Open Clockify in Chrome"| Finicky
+
+    %% logwork lua shells out
+    LogworkLua -->|"cd $LOG_WORK_REPO<br/>log-work --open"| LogWork
+
+    %% Clockify CLI
+    Clockify <-->|HTTPS| ClockifyAPI
+    Clockify -->|writes after start/stop/punch/status| Cache
+
+    %% log-work CLI
+    LogWork -->|"clockify log --json"| Clockify
+    LogWork -->|reads commits| Git
+    LogWork -->|writes| HTML
+    LogWork -->|"--open<br/>(local file)"| OpenProfile
+    OpenProfile -->|--profile-directory| Chrome
+
+    %% Finicky routes URLs
+    Finicky -->|by host| Chrome
+```
+
+A few things worth noting:
+
+- **The status cache (`~/.cache/clockify/status.json`) is the hub.** The
+  Hammerspoon tracker reads it directly — no shell-out, so menu opens are
+  instant. The `clockify` CLI writes it on every `start`/`stop`/`punch`/
+  `status` so the bar updates immediately after a CLI toggle.
+- **`log-work` shells out to `clockify`.** That `--json` contract is the
+  single cross-tool dependency.
+- **Two paths to Chrome.** Real URLs go through Finicky (routes by host);
+  local files like the `log-work` HTML go through `open-profile` because
+  Finicky only handles http/https.
+
 ## Conventions
 
 - **Edit in place.** Symlinks resolve to the live file — no rebuild step.
