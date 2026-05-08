@@ -64,7 +64,9 @@ ln -sf ~/dev/cli/log-work/log-work ~/.local/bin/log-work
 Add to `~/.zshrc`:
 
 ```sh
-export LOG_WORK_AUTHOR="Your Name"     # required — must match your git author name
+export LOG_WORK_AUTHOR="Your Name"     # optional — falls back to `git config user.name`,
+                                       # then to "no filter" with a warning. Must match
+                                       # your git author name to filter to just your commits.
 # Optional:
 # export LOG_WORK_SHEET_URL="https://docs.google.com/spreadsheets/d/..."
 # export LOG_WORK_HOURLY_RATE="0"        # set if you want $ figures in the paycheck readout

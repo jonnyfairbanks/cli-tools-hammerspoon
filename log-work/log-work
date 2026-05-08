@@ -37,10 +37,13 @@ OPEN_PROFILE = ENV["LOG_WORK_OPEN_PROFILE"] ||
                File.expand_path("../../open-profile/open", File.realpath(__FILE__))
 # ───────────────────────────────────────────────────────────────────────────────
 
-if AUTHOR.nil? || AUTHOR.strip.empty?
-  warn "error: LOG_WORK_AUTHOR is not set."
-  warn "        Add `export LOG_WORK_AUTHOR=\"Your Name\"` to ~/.zshrc — must match your git author name."
-  exit 2
+def resolve_author(env_value, repo)
+  return env_value if env_value && !env_value.strip.empty?
+  # Fall back to the repo's git config — if the user is committing in this
+  # repo, that's almost certainly the name they'd want filtered on.
+  raw = IO.popen(["git", "-C", repo, "config", "user.name"], err: File::NULL, &:read).to_s.strip
+  return raw unless raw.empty?
+  nil
 end
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,6 +88,13 @@ unless File.directory?(File.join(repo, ".git"))
   exit 2
 end
 
+resolved_author = resolve_author(AUTHOR, repo)
+if resolved_author.nil? || resolved_author.empty?
+  warn "warning: no LOG_WORK_AUTHOR set and `git config user.name` is empty in #{repo}."
+  warn "         Generating report with no author filter — every commit on origin/main will be included."
+  warn "         Set `export LOG_WORK_AUTHOR=\"Your Name\"` in ~/.zshrc to filter to just your commits."
+end
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Git
 
@@ -94,7 +104,6 @@ def git_commits(repo:, year:, month:, author:, until_date:)
   fmt = "%cd|%h|%s"
   cmd = [
     "git", "-C", repo, "log",
-    "--author=#{author}",
     "--since=#{start}",
     "--until=#{finish}",
     "--no-merges",
@@ -102,6 +111,7 @@ def git_commits(repo:, year:, month:, author:, until_date:)
     "--date=format:%Y-%m-%d",
     "origin/main"
   ]
+  cmd.insert(4, "--author=#{author}") if author && !author.empty?
   raw = IO.popen(cmd, &:read)
   raise "git log failed (exit #{$?.exitstatus})" unless $?.success?
 
@@ -125,7 +135,7 @@ end_date =
     last_day_of_month.strftime("%Y-%m-%d")
   end
 
-git_by_date = git_commits(repo: repo, year: year, month: month, author: AUTHOR, until_date: end_date)
+git_by_date = git_commits(repo: repo, year: year, month: month, author: resolved_author, until_date: end_date)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Clockify
@@ -139,7 +149,7 @@ def clockify_hours(year:, month:)
   end
   { ok: true, data: parsed, error: nil }
 rescue Errno::ENOENT
-  { ok: false, data: {}, error: "clockify CLI not found on PATH" }
+  { ok: false, data: {}, error: "clockify CLI not found on PATH (install it from ../clockify or run without hours)" }
 rescue JSON::ParserError => e
   { ok: false, data: {}, error: "clockify JSON parse error: #{e.message}" }
 end
@@ -560,7 +570,7 @@ summary = {
   month: format("%04d-%02d", year, month),
   month_label: month_label,
   repo: repo,
-  author: AUTHOR,
+  author: resolved_author,
   html_path: out_path,
   totals: {
     days_with_activity: active_days.length,

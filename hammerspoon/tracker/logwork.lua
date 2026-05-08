@@ -3,16 +3,34 @@
 -- generated HTML report pops up in the default browser. Runs async via
 -- hs.task.new so the calling menu can show a spinner while it works.
 --
--- ── EDIT ME ────────────────────────────────────────────────────────────────
--- Either set $LOG_WORK_REPO in your shell rc, or hard-code the repo path below.
-local REPO = os.getenv("LOG_WORK_REPO") or (os.getenv("HOME") .. "/dev/your-repo")
+-- Set $LOG_WORK_REPO in your shell rc to point at the git repo to summarise.
+-- If unset, the runner shows a notification telling you to set it instead of
+-- failing silently.
+
+local REPO = os.getenv("LOG_WORK_REPO")
 local CLI  = os.getenv("HOME") .. "/.local/bin/log-work"
--- ───────────────────────────────────────────────────────────────────────────
 
 local M = {}
 
+-- Treat the repo as configured only if it's set AND points at a real
+-- directory. Catches both unset env and the placeholder default that some
+-- people forget to swap out.
+local function repoOk()
+  if not REPO or REPO == "" then return false end
+  return hs.fs.attributes(REPO) ~= nil
+end
+
 -- onComplete(ok) is invoked when the report finishes (success or failure).
 function M.run(onComplete)
+  if not repoOk() then
+    local msg = REPO and ("LOG_WORK_REPO points at " .. REPO .. " — not a directory")
+                       or "set $LOG_WORK_REPO in ~/.zshrc and reload Hammerspoon"
+    print("[log-work] skipping: " .. msg)
+    hs.notify.new({ title = "log-work — not configured", informativeText = msg }):send()
+    if onComplete then onComplete(false) end
+    return
+  end
+
   -- Hammerspoon's shell doesn't inherit LANG/LC_ALL, and Ruby chokes on
   -- non-ASCII git output without them — set explicitly here.
   local cmd = string.format("export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && cd %q && %q --open 2>&1", REPO, CLI)

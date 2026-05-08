@@ -24,7 +24,8 @@ Edits to the script are picked up immediately — the symlink resolves to the li
 ## Config
 
 ```bash
-# required
+# optional — if unset, falls back to `git config user.name` in the target repo,
+# and if that's also empty, runs with no author filter and prints a warning
 export LOG_WORK_AUTHOR="Your Name"          # must match your git author name
 
 # optional

@@ -96,10 +96,12 @@ Most personalisation flows through env vars in `~/.zshrc`. Where there's an
 "EDIT ME" block at the top of a file, that's deliberate — it's where the
 most likely customisation lives. Search for `EDIT ME` to find them all.
 
-Required for full functionality:
-- `LOG_WORK_AUTHOR` — git author name (must match commits exactly)
+Required for full functionality: nothing — every variable has a fallback or
+soft-warns rather than failing.
 
 Optional / defaulted:
+- `LOG_WORK_AUTHOR` — git author name; falls back to `git config user.name`,
+  then to "no filter" with a stderr warning
 - `CLOCKIFY_API_KEY` — set to use the Clockify API; unset to use local-only JSONL mode
 - `CLOCKIFY_BACKEND` — force `local` or `api` regardless of key presence
 - `CLOCKIFY_PROJECT`, `CLOCKIFY_WEEKLY_LIMIT`, `CLOCKIFY_HOURLY_RATE`

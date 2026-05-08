@@ -122,13 +122,43 @@ local function refresh()
   end
 end
 
+-- Shell-escape a string so it can be embedded inside single quotes safely.
+local function shellEscape(s)
+  return "'" .. (s or ""):gsub("'", "'\\''") .. "'"
+end
+
+-- Read the cache so punch() knows whether we're starting or stopping
+-- without a network round-trip.
+local function isCurrentlyRunning()
+  local path = os.getenv("HOME") .. "/.cache/clockify/status.json"
+  local f = io.open(path, "r")
+  if not f then return false end
+  local body = f:read("*a")
+  f:close()
+  local data = hs.json.decode(body)
+  return data and data.running == true
+end
+
 local function punch()
   if spinnerTimer then return end
-  startSpinner()
-  runAsync(CLI .. " punch -y", function()
-    stopSpinner()
-    refresh()
-  end)
+
+  if isCurrentlyRunning() then
+    -- Stopping — no prompt needed
+    startSpinner()
+    runAsync(CLI .. " punch -y", function()
+      stopSpinner()
+      refresh()
+    end)
+  else
+    -- Starting — prompt for a description first.
+    local btn, text = hs.dialog.textPrompt("Punch in", "What are you working on?", "", "Start", "Cancel")
+    if btn ~= "Start" then return end
+    startSpinner()
+    runAsync(CLI .. " punch -y -d " .. shellEscape(text), function()
+      stopSpinner()
+      refresh()
+    end)
+  end
 end
 
 M.punch = punch
