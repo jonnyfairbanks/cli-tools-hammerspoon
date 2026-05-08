@@ -13,10 +13,13 @@ gives it the context it needs to wire everything up for you.
 
 ### [`clockify/`](./clockify/)
 
-Ruby CLI for the [Clockify](https://clockify.me) time-tracking REST API.
-Stdlib only, single file. Clock in/out (`start`, `stop`, `punch`), report
-hours (`log`, with `--json`), and a cached `status` subcommand designed to
-be polled by a menu bar widget.
+Ruby CLI for time tracking. Stdlib only, single file. Two interchangeable
+backends: the [Clockify](https://clockify.me) REST API (when
+`CLOCKIFY_API_KEY` is set) or a local-only JSONL log (when it isn't).
+Same commands, same JSON output — `log-work` and the Hammerspoon widget
+work identically against either backend. Clock in/out (`start`, `stop`,
+`punch`), report hours (`log`, with `--json`), and a cached `status`
+subcommand designed to be polled by a menu bar widget.
 
 ### [`log-work/`](./log-work/)
 
@@ -66,7 +69,8 @@ flowchart TD
     Cache[("~/.cache/clockify/<br/>status.json<br/>60s TTL")]
     HTML[("/tmp/log-work-YYYY-MM.html")]
 
-    ClockifyAPI[(Clockify REST API)]
+    ClockifyAPI[("Clockify REST API<br/>(api backend, optional)")]
+    LocalStore[("~/.local/share/clockify/<br/>entries.jsonl<br/>(local backend)")]
     Git[(git log on origin/main)]
     Finicky["Finicky<br/>default browser"]
     Chrome[Chrome profiles]
@@ -91,8 +95,9 @@ flowchart TD
     %% logwork lua shells out
     LogworkLua -->|"cd $LOG_WORK_REPO<br/>log-work --open"| LogWork
 
-    %% Clockify CLI
-    Clockify <-->|HTTPS| ClockifyAPI
+    %% Clockify CLI — picks one backend per invocation
+    Clockify <-->|HTTPS<br/>if CLOCKIFY_API_KEY set| ClockifyAPI
+    Clockify <-->|append/read JSONL<br/>otherwise| LocalStore
     Clockify -->|writes after start/stop/punch/status| Cache
 
     %% log-work CLI
@@ -114,6 +119,10 @@ A few things worth noting:
   `status` so the bar updates immediately after a CLI toggle.
 - **`log-work` shells out to `clockify`.** That `--json` contract is the
   single cross-tool dependency.
+- **`clockify` itself has two interchangeable backends.** Set
+  `CLOCKIFY_API_KEY` to sync with Clockify's web/mobile apps, or leave it
+  unset to keep everything in a local JSONL log. Same commands, same
+  output shape — log-work and the Hammerspoon widget don't notice.
 - **Two paths to Chrome.** Real URLs go through Finicky (routes by host);
   local files like the `log-work` HTML go through `open-profile` because
   Finicky only handles http/https.

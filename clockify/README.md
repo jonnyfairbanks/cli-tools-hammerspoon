@@ -22,11 +22,27 @@ Edits to the script are picked up immediately — the symlink resolves to the li
 
 ## Config
 
-Two env vars:
-
 ```bash
-export CLOCKIFY_API_KEY="..."           # required — generate at https://app.clockify.me/user/settings → API
-export CLOCKIFY_PROJECT="my-project"    # optional — default project for log/start/punch
+# Choose your backend:
+export CLOCKIFY_API_KEY="..."           # set → use Clockify REST API (syncs with web/mobile)
+                                        # unset → fall back to local-only mode
+export CLOCKIFY_PROJECT="my-project"    # default project for log/start/punch (both backends)
+```
+
+Backends:
+
+- **api** (default when `CLOCKIFY_API_KEY` is set) — talks to the Clockify
+  REST API. Workspace ID is auto-discovered from the API key's owner. Generate
+  a key at https://app.clockify.me/user/settings → **API**.
+- **local** (default when `CLOCKIFY_API_KEY` is empty) — appends entries to
+  `~/.local/share/clockify/entries.jsonl`. No network, no auth, no web UI.
+  Same JSON output shape, so `log-work` and the Hammerspoon widget work
+  identically.
+
+Force a backend explicitly:
+```bash
+export CLOCKIFY_BACKEND=local           # ignore any API key
+export CLOCKIFY_BACKEND=api             # error out if no key, instead of falling back
 ```
 
 Optional knobs (or edit the constants at the top of `clockify`):
@@ -35,8 +51,6 @@ Optional knobs (or edit the constants at the top of `clockify`):
 export CLOCKIFY_WEEKLY_LIMIT="40"       # hours/week — used by the `week` readout
 export CLOCKIFY_HOURLY_RATE="0"         # USD/hour — used by the paycheck readout (0 = no $ figures)
 ```
-
-The workspace ID is auto-discovered from the API key's owner — no extra config needed.
 
 ## Usage
 
@@ -100,6 +114,28 @@ Idle:
 ```json
 {"running":false,"fetched_at":"2026-04-29T16:55:00Z"}
 ```
+
+## Local mode notes
+
+- **Storage:** `~/.local/share/clockify/entries.jsonl`. One line per entry, in the
+  same shape Clockify's API returns. Human-readable — `vim` it to edit past
+  entries.
+- **No web UI.** `clockify open` prints the store path instead of launching the
+  browser.
+- **No mobile app, no cross-device sync.** Each machine has its own log.
+- **Project list comes from the JSONL itself.** First `start` for a new project
+  just works — no "project doesn't exist" error.
+
+## Editing past entries (local mode)
+
+Forgot to clock out? Wrong description? Just edit the JSONL:
+
+```bash
+vim ~/.local/share/clockify/entries.jsonl
+```
+
+Each line is independent. Fix the `start` / `end` / `description` / `project`
+field and save. Re-run `clockify status --refresh` to refresh the cache.
 
 ## Hammerspoon menu bar widget
 

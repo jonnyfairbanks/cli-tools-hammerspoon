@@ -4,9 +4,29 @@ Guidance for Claude Code working in this directory.
 
 ## Overview
 
-`clockify` is a CLI (Ruby, stdlib only) for the Clockify time-tracking REST API. Subcommands:
+`clockify` is a time-tracking CLI (Ruby, stdlib only) with two interchangeable
+backends:
 
-- `clockify` (no args) / `clockify --help` — print top-level usage and exit 0.
+- **ApiBackend** — talks to the Clockify REST API. Used when `CLOCKIFY_API_KEY`
+  is set, or when `CLOCKIFY_BACKEND=api` is forced.
+- **LocalBackend** — append-only JSONL log at
+  `~/.local/share/clockify/entries.jsonl`. Used when there's no API key, or
+  when `CLOCKIFY_BACKEND=local` is forced.
+
+Both backends return entries in the Clockify API shape (`timeInterval` with
+`start`/`end`/`duration`, `description`, `projectId`, plus a decorated
+`project` name). The `cmd_*` methods, the status cache shape, and the
+`log --json` output are all backend-agnostic — `log-work` and the
+Hammerspoon widget don't know or care which backend is in use.
+
+To add a new backend, subclass `Backend` and implement four methods:
+`find_running_entry`, `start_entry(project, desc)`, `stop_entry(running)`,
+`entries_in_range(project, t1, t2)`. See `LocalBackend` for the simplest
+reference impl.
+
+## Subcommands
+
+- `clockify` (no args) / `clockify --help` — print top-level usage (including which backend is active) and exit 0.
 - `clockify log [-m MM] [-y YYYY] [-d DD] [-p PROJECT] [--json]` — report hours per day for a month (or single day) on the configured project. `--json` emits machine-readable output.
 - `clockify start [-p PROJECT] [-d DESCRIPTION]` — clock in. Errors out (exit 1) if an entry is already running.
 - `clockify stop` — stop the currently running entry. Warns (exit 1) if none.
@@ -31,10 +51,11 @@ User-triggered actions in the menu (Punch, Refresh now) run async via `hs.task.n
 
 ## Config
 
-- `CLOCKIFY_API_KEY` (required) — generate at https://app.clockify.me/user/settings → API. Export from `~/.zshrc`.
+- `CLOCKIFY_API_KEY` (optional) — set to use the API backend. Generate at https://app.clockify.me/user/settings → API. Unset = local-only mode.
+- `CLOCKIFY_BACKEND` (optional) — force `local` or `api` regardless of the key being set. Useful for peers who have Clockify at work but want this for personal time.
 - `CLOCKIFY_PROJECT` (optional) — default project name. Falls back to the `PROJECT_NAME` constant near the top of `clockify`.
 - `CLOCKIFY_WEEKLY_LIMIT` / `CLOCKIFY_HOURLY_RATE` (optional) — used by the `week` / paycheck readouts.
-- Workspace ID is auto-discovered from the API key's user (`GET /user` returns `defaultWorkspace`).
+- Workspace ID is auto-discovered from the API key's user (`GET /user` returns `defaultWorkspace`) when using the API backend.
 
 ## Conventions
 

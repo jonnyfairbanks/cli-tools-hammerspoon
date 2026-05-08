@@ -19,7 +19,7 @@ The steps assume you cloned this repo to `~/dev/cli`. Adjust paths if not.
 - [Finicky](https://github.com/johnste/finicky) (only if you want
   per-profile URL routing): `brew install --cask finicky`.
 
-## 1. Clockify CLI
+## 1. clockify CLI
 
 ```bash
 mkdir -p ~/.local/bin
@@ -27,19 +27,31 @@ chmod +x ~/dev/cli/clockify/clockify
 ln -sf ~/dev/cli/clockify/clockify ~/.local/bin/clockify
 ```
 
-Get a Clockify API key at https://app.clockify.me/user/settings → **API**,
-then add to `~/.zshrc`:
+You have two options for the backend:
+
+**Option A — Clockify API** (syncs with the Clockify web/mobile apps; needed
+if your company invoices off Clockify):
 
 ```sh
-export CLOCKIFY_API_KEY="..."
-export CLOCKIFY_PROJECT="my-project"   # optional default; -p overrides per call
+# in ~/.zshrc:
+export CLOCKIFY_API_KEY="..."          # generate at https://app.clockify.me/user/settings → API
+export CLOCKIFY_PROJECT="my-project"   # default project; -p overrides per call
 ```
 
-`source ~/.zshrc` and verify:
+**Option B — local only** (zero setup, no auth, entries stored at
+`~/.local/share/clockify/entries.jsonl`):
+
+```sh
+# in ~/.zshrc:
+export CLOCKIFY_PROJECT="my-project"   # whatever you want to call your default bucket
+# don't set CLOCKIFY_API_KEY
+```
+
+Either way, `source ~/.zshrc` and verify:
 
 ```bash
-clockify --help
-clockify status
+clockify --help        # bottom line shows which backend is active
+clockify status        # should print "■ idle"
 ```
 
 ## 2. log-work CLI
@@ -144,10 +156,12 @@ log-work --json | head -20
 
 ## Troubleshooting
 
-- **"CLOCKIFY_API_KEY not set"** — you set it in `~/.zshrc` but Hammerspoon
-  doesn't see it. The widget shells out via `zsh -l -i -c`, which sources
-  `~/.zshrc`, so confirm the export is in there (not `~/.bash_profile` or
-  similar) and that there are no syntax errors above it.
+- **API mode: "CLOCKIFY_API_KEY not set"** — you set it in `~/.zshrc` but
+  Hammerspoon doesn't see it. The widget shells out via `zsh -l -i -c`,
+  which sources `~/.zshrc`, so confirm the export is in there (not
+  `~/.bash_profile` or similar) and that there are no syntax errors above
+  it. If you'd rather not use the API at all, just unset the key —
+  `clockify` will fall back to local mode automatically.
 - **Tracker widget shows `⚠`** — `clockify status --json` is failing.
   Run it manually to see the error. Most often: API key missing or wrong
   `CLOCKIFY_PROJECT`.

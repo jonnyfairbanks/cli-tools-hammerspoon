@@ -17,9 +17,11 @@ and the `tracker` Hammerspoon widget polls `clockify status`.
 
 ## Subdirectories
 
-- `clockify/` — Ruby CLI (`clockify`) for the Clockify time-tracking API.
-  Subcommands `log`, `start`, `stop`, `punch`, `status`, `day`, `week`,
-  `open`. Has its own detailed `CLAUDE.md` and `README.md`.
+- `clockify/` — Ruby CLI (`clockify`) for time tracking. Two interchangeable
+  backends: the Clockify REST API (when `CLOCKIFY_API_KEY` is set) or a
+  local-only JSONL log at `~/.local/share/clockify/entries.jsonl`. Same
+  subcommands either way: `log`, `start`, `stop`, `punch`, `status`, `day`,
+  `week`, `open`. Has its own detailed `CLAUDE.md` and `README.md`.
 - `log-work/` — Ruby CLI (`log-work`) that builds a month-shaped HTML
   timesheet from `git log` + `clockify log --json`. `--json` mode for LLM
   consumption.
@@ -95,10 +97,11 @@ Most personalisation flows through env vars in `~/.zshrc`. Where there's an
 most likely customisation lives. Search for `EDIT ME` to find them all.
 
 Required for full functionality:
-- `CLOCKIFY_API_KEY` — Clockify API key
 - `LOG_WORK_AUTHOR` — git author name (must match commits exactly)
 
 Optional / defaulted:
+- `CLOCKIFY_API_KEY` — set to use the Clockify API; unset to use local-only JSONL mode
+- `CLOCKIFY_BACKEND` — force `local` or `api` regardless of key presence
 - `CLOCKIFY_PROJECT`, `CLOCKIFY_WEEKLY_LIMIT`, `CLOCKIFY_HOURLY_RATE`
 - `LOG_WORK_REPO`, `LOG_WORK_SHEET_URL`, `LOG_WORK_CHROME_PROFILE`,
   `LOG_WORK_HOURLY_RATE`, `LOG_WORK_WEEKLY_CAP`, `LOG_WORK_WEEKLY_WARN`,
